@@ -44,6 +44,7 @@ bash scripts/protein-baseline/stage1_pretrain_projector.sh \
   SYSTEM_PROMPT=scripts/protein-baseline/prompts/system/caption_default.txt \
   OUTPUT=checkpoints/protein_stage1
 ```
+The script keeps common LLaVA training knobs (e.g., `DEEPSPEED_CONFIG=./scripts/zero3.json`, `REPORT_TO=wandb`, cosine schedule, warmup ratio, gradient checkpointing) exposed as environment variables so you can quickly align with prior recipes.
 
 ## Stage 2: finetuning
 Train projector + LLM jointly (full finetuning or LoRA). Mix caption and QA JSONL files as needed.
@@ -63,6 +64,7 @@ bash scripts/protein-baseline/stage2_finetune_lora.sh \
   SYSTEM_PROMPT=scripts/protein-baseline/prompts/system/qa_default.txt \
   OUTPUT=checkpoints/protein_stage2_lora
 ```
+Both finetuning scripts preserve the earlier LLaVA launch options (deepspeed config, W&B logging via `REPORT_TO`, gradient checkpointing, TF32, scheduler and warmup settings, modality length grouping) for quick adjustment without editing the file.
 
 ### Debug mode
 Add `DEBUG_PROMPT=True DEBUG_EVERY=200` to any training script to print formatted prompts and short generations during training.
