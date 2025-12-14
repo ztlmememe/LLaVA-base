@@ -60,10 +60,16 @@ class ModelArguments:
     mm_vision_select_layer: Optional[int] = field(default=-1)   # default to the last layer
     pretrain_mm_mlp_adapter: Optional[str] = field(default=None)
     mm_projector_type: Optional[str] = field(default='linear')
+    mm_projector_prefix_length: int = field(default=1)
+    mm_projector_use_norm: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
     mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
+    protein_tower: Optional[str] = field(default=None)
+    protein_dtype: Optional[str] = field(default=None)
+    protein_device: Optional[str] = field(default=None)
+    train_protein_tower: bool = field(default=False)
 
 
 @dataclass
@@ -74,6 +80,13 @@ class DataArguments:
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
+    system_prompt_path: Optional[str] = None
+    system_prompt_text: Optional[str] = None
+    task_template: Optional[str] = field(default="auto")
+    protein_baseline: bool = field(default=False)
+    debug_prompt: bool = field(default=False)
+    debug_every_n_steps: int = field(default=200)
+    protein_tokenizer: Optional[object] = None
 
 
 @dataclass
@@ -739,11 +752,75 @@ class LazySupervisedDataset(Dataset):
         return data_dict
 
 
+class ProteinSupervisedDataset(Dataset):
+    """Dataset for protein-to-text training."""
+
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, protein_tokenizer, data_args: DataArguments):
+        super().__init__()
+        with open(data_path, "r") as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        self.samples = lines
+        self.tokenizer = tokenizer
+        self.protein_tokenizer = protein_tokenizer
+        self.data_args = data_args
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _build_prompt(self, sample):
+        seq = sample.get("protein_sequence", "").strip()
+        is_qa = sample.get("answer") is not None or getattr(self.data_args, "task_template", "auto") == "qa"
+        if is_qa:
+            question = sample.get("question", "").strip()
+            user_prompt = f"Protein sequence: {seq}\nQuestion: {question}\nAnswer concisely."
+            target = sample.get("answer", "").strip()
+        else:
+            desc = sample.get("function_description", "").strip()
+            user_prompt = f"Provide a concise functional description for the following protein sequence.\nProtein sequence: {seq}"
+            target = desc
+        prompt = self.data_args.system_prompt_text or ""
+        if prompt:
+            prompt = prompt.strip()
+        formatted_prompt = prompt + "\n" + user_prompt if prompt else user_prompt
+        conversations = [
+            {"from": "human", "value": formatted_prompt},
+            {"from": "gpt", "value": target}
+        ]
+        return conversations, formatted_prompt
+
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        conversations, formatted_prompt = self._build_prompt(sample)
+        data_dict = preprocess(
+            [copy.deepcopy(conversations)],
+            self.tokenizer,
+            has_image=False
+        )
+        protein_tokens = self.protein_tokenizer(
+            sample.get("protein_sequence", ""),
+            return_tensors="pt",
+            padding=False,
+            truncation=True
+        )
+        data_item = dict(
+            input_ids=data_dict["input_ids"][0],
+            labels=data_dict["labels"][0],
+            protein_inputs={
+                "input_ids": protein_tokens.input_ids[0],
+                "attention_mask": protein_tokens.attention_mask[0]
+            },
+            prompt_text=formatted_prompt
+        )
+        return data_item
+
+
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    protein_tokenizer: Optional[transformers.PreTrainedTokenizer] = None
+    debug_prompt: bool = False
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
@@ -770,16 +847,38 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch['images'] = images
 
+        if 'protein_inputs' in instances[0]:
+            protein_ids = [inst['protein_inputs']['input_ids'] for inst in instances]
+            protein_masks = [inst['protein_inputs']['attention_mask'] for inst in instances]
+            pad_token = self.protein_tokenizer.pad_token_id if self.protein_tokenizer is not None else 0
+            protein_ids = torch.nn.utils.rnn.pad_sequence(protein_ids, batch_first=True, padding_value=pad_token)
+            protein_masks = torch.nn.utils.rnn.pad_sequence(protein_masks, batch_first=True, padding_value=0)
+            batch['protein_inputs'] = {
+                "input_ids": protein_ids,
+                "attention_mask": protein_masks
+            }
+
+        if self.debug_prompt and 'prompt_text' in instances[0]:
+            batch['debug_prompts'] = [inst['prompt_text'] for inst in instances]
+
         return batch
 
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args) -> Dict:
+                                data_args, protein_tokenizer=None) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                data_args=data_args)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    if getattr(data_args, 'protein_baseline', False):
+        train_dataset = ProteinSupervisedDataset(
+            tokenizer=tokenizer,
+            protein_tokenizer=protein_tokenizer,
+            data_path=data_args.data_path,
+            data_args=data_args
+        )
+    else:
+        train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
+                                    data_path=data_args.data_path,
+                                    data_args=data_args)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, protein_tokenizer=protein_tokenizer, debug_prompt=getattr(data_args, 'debug_prompt', False))
     return dict(train_dataset=train_dataset,
                 eval_dataset=None,
                 data_collator=data_collator)
@@ -793,6 +892,11 @@ def train(attn_implementation=None):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+
+    if data_args.system_prompt_path is not None:
+        with open(data_args.system_prompt_path, "r") as f:
+            data_args.system_prompt_text = f.read()
+        conversation_lib.default_conversation.system = data_args.system_prompt_text
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -812,6 +916,8 @@ def train(attn_implementation=None):
                 bnb_4bit_quant_type=training_args.quant_type # {'fp4', 'nf4'}
             )
         ))
+
+    protein_tokenizer = None
 
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
@@ -907,6 +1013,19 @@ def train(attn_implementation=None):
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
+    if model_args.protein_tower is not None:
+        protein_tokenizer = transformers.AutoTokenizer.from_pretrained(model_args.protein_tower, trust_remote_code=True)
+        if protein_tokenizer.pad_token is None:
+            protein_tokenizer.pad_token = protein_tokenizer.eos_token or protein_tokenizer.unk_token
+        if model_args.protein_dtype is not None:
+            model_args.protein_dtype = getattr(torch, model_args.protein_dtype)
+            model.config.protein_dtype = model_args.protein_dtype
+        if model_args.protein_device is not None:
+            model.config.protein_device = model_args.protein_device
+        data_args.protein_tokenizer = protein_tokenizer
+        data_args.protein_baseline = True
+        model.get_model().initialize_protein_modules(model_args=model_args, fsdp=training_args.fsdp)
+
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,
@@ -957,11 +1076,18 @@ def train(attn_implementation=None):
                         module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
-                                              data_args=data_args)
+                                              data_args=data_args,
+                                              protein_tokenizer=protein_tokenizer)
     trainer = LLaVATrainer(model=model,
                     tokenizer=tokenizer,
                     args=training_args,
                     **data_module)
+
+    trainer.debug_prompt = data_args.debug_prompt
+    trainer.debug_every_n_steps = data_args.debug_every_n_steps
+    trainer.debug_tokenizer = tokenizer
+    trainer.debug_system_prompt_path = data_args.system_prompt_path
+    trainer.debug_system_prompt = (data_args.system_prompt_text or "").split("\n")[:2]
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

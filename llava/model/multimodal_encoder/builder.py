@@ -1,5 +1,7 @@
 import os
+import torch
 from .clip_encoder import CLIPVisionTower, CLIPVisionTowerS2
+from .protein_encoder import ProteinSequenceTower
 
 
 def build_vision_tower(vision_tower_cfg, **kwargs):
@@ -13,3 +15,10 @@ def build_vision_tower(vision_tower_cfg, **kwargs):
             return CLIPVisionTower(vision_tower, args=vision_tower_cfg, **kwargs)
 
     raise ValueError(f'Unknown vision tower: {vision_tower}')
+
+
+def build_protein_tower(protein_tower_cfg, **kwargs):
+    protein_tower = getattr(protein_tower_cfg, 'mm_protein_tower', None)
+    if protein_tower is None:
+        return None
+    return ProteinSequenceTower(protein_tower, dtype=getattr(protein_tower_cfg, 'protein_dtype', torch.float16), device=getattr(protein_tower_cfg, 'protein_device', 'cuda'))

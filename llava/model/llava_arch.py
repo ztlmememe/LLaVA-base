@@ -18,7 +18,7 @@ from abc import ABC, abstractmethod
 import torch
 import torch.nn as nn
 
-from .multimodal_encoder.builder import build_vision_tower
+from .multimodal_encoder.builder import build_vision_tower, build_protein_tower
 from .multimodal_projector.builder import build_vision_projector
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
@@ -35,6 +35,10 @@ class LlavaMetaModel:
             self.vision_tower = build_vision_tower(config, delay_load=True)
             self.mm_projector = build_vision_projector(config)
 
+        if hasattr(config, "mm_protein_tower"):
+            self.protein_tower = build_protein_tower(config)
+            self.mm_projector = build_vision_projector(config)
+
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
@@ -45,6 +49,12 @@ class LlavaMetaModel:
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
+
+    def get_protein_tower(self):
+        protein_tower = getattr(self, 'protein_tower', None)
+        if type(protein_tower) is list:
+            protein_tower = protein_tower[0]
+        return protein_tower
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower
@@ -96,6 +106,44 @@ class LlavaMetaModel:
 
             self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
 
+    def initialize_protein_modules(self, model_args, fsdp=None):
+        protein_tower = model_args.protein_tower
+        if protein_tower is None:
+            return
+
+        self.config.mm_protein_tower = protein_tower
+        if self.get_protein_tower() is None:
+            protein_model = build_protein_tower(model_args)
+            if fsdp is not None and len(fsdp) > 0:
+                self.protein_tower = [protein_model]
+            else:
+                self.protein_tower = protein_model
+        else:
+            protein_model = self.get_protein_tower()
+            protein_model.load_model()
+
+        self.config.use_mm_proj = True
+        self.config.mm_hidden_size = protein_model.hidden_size
+        self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        self.config.mm_projector_prefix_length = getattr(model_args, 'mm_projector_prefix_length', 1)
+        self.config.mm_projector_use_norm = getattr(model_args, 'mm_projector_use_norm', False)
+
+        if not getattr(model_args, 'train_protein_tower', False):
+            protein_model.requires_grad_(False)
+
+        if getattr(self, 'mm_projector', None) is None:
+            self.mm_projector = build_vision_projector(self.config)
+        else:
+            for p in self.mm_projector.parameters():
+                p.requires_grad = True
+
+    def encode_proteins(self, input_ids, attention_mask=None):
+        protein_tower = self.get_protein_tower()
+        if protein_tower is None:
+            return None
+        hidden_states = protein_tower(input_ids=input_ids, attention_mask=attention_mask)
+        return self.get_model().mm_projector(hidden_states, attention_mask)
+
 
 def unpad_image(tensor, original_size):
     """
@@ -144,8 +192,33 @@ class LlavaMetaForCausalLM(ABC):
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
-        images, image_sizes=None
+        images, image_sizes=None, protein_inputs=None
     ):
+        if protein_inputs is not None:
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+            protein_prefix = self.encode_proteins(
+                protein_inputs.get("input_ids"),
+                protein_inputs.get("attention_mask")
+            )
+            text_embeds = self.get_model().embed_tokens(input_ids)
+            prefix_labels = torch.full(
+                (input_ids.shape[0], protein_prefix.shape[1]),
+                IGNORE_INDEX,
+                dtype=labels.dtype if labels is not None else torch.long,
+                device=text_embeds.device
+            )
+            combined_embeds = torch.cat([protein_prefix, text_embeds], dim=1)
+            new_attention = torch.cat(
+                [torch.ones((attention_mask.shape[0], protein_prefix.shape[1]), device=attention_mask.device, dtype=attention_mask.dtype), attention_mask],
+                dim=1
+            )
+            if labels is not None:
+                labels = torch.cat([prefix_labels, labels], dim=1)
+            position_ids = torch.arange(0, combined_embeds.shape[1], dtype=position_ids.dtype if position_ids is not None else torch.long, device=combined_embeds.device).unsqueeze(0)
+            position_ids = position_ids.expand(combined_embeds.shape[0], -1)
+            return None, position_ids, new_attention, past_key_values, combined_embeds, labels
+
         vision_tower = self.get_vision_tower()
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
