@@ -248,6 +248,45 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
+    def compute_loss(self, model, inputs, return_outputs=False):
+        debug_prompts = inputs.pop("debug_prompts", None)
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True)
+
+        should_debug = getattr(self, "debug_prompt", False) and debug_prompts is not None
+        if should_debug and (self.state.global_step % getattr(self, "debug_every_n_steps", 200) == 0):
+            if self.args.local_rank in (-1, 0):
+                prompt_preview = debug_prompts[0] if isinstance(debug_prompts, list) else str(debug_prompts)
+                sys_info = getattr(self, "debug_system_prompt_path", None)
+                if sys_info:
+                    print(f"[Debug] system prompt ({sys_info}):", getattr(self, "debug_system_prompt", [])[:1])
+                print(f"[Debug] training prompt: {prompt_preview[:300]}")
+                sample_inputs = {k: v for k, v in inputs.items()}
+                if "input_ids" in sample_inputs:
+                    sample_inputs["input_ids"] = sample_inputs["input_ids"][:1]
+                if "attention_mask" in sample_inputs:
+                    sample_inputs["attention_mask"] = sample_inputs["attention_mask"][:1]
+                if "protein_inputs" in sample_inputs:
+                    protein_data = sample_inputs["protein_inputs"]
+                    sample_inputs["protein_inputs"] = {kk: vv[:1] for kk, vv in protein_data.items()}
+                try:
+                    with torch.no_grad():
+                        gen_ids = model.generate(
+                            inputs=sample_inputs.get("input_ids"),
+                            attention_mask=sample_inputs.get("attention_mask"),
+                            images=sample_inputs.get("images"),
+                            protein_inputs=sample_inputs.get("protein_inputs"),
+                            max_new_tokens=32,
+                            do_sample=False
+                        )
+                    tokenizer = getattr(self, "debug_tokenizer", None)
+                    if tokenizer is not None:
+                        decoded = tokenizer.decode(gen_ids[0], skip_special_tokens=True)
+                        print(f"[Debug] generation sample: {decoded[:200]}")
+                except Exception as exc:  # pragma: no cover - debug path
+                    print(f"[Debug] generation failed: {exc}")
+
+        return (loss, outputs) if return_outputs else loss
+
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
